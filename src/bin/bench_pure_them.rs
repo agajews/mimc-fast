@@ -1,25 +1,71 @@
+//! cargo +nightly run --bin bench_pure_them --release
+#![allow(non_snake_case)]
 #![feature(proc_macro_hygiene, decl_macro)]
-
-#[macro_use]
-extern crate rocket;
 
 #[macro_use]
 extern crate lazy_static;
 
 use bigint::U512;
-
-use serde::{Serialize, Deserialize};
-use rocket_contrib::json::Json;
-
+use mimc_fast::explorers::*;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
-use rocket::http::Method;
-use rocket_cors::{AllowedHeaders, AllowedOrigins, catch_all_options_routes};
+const PLANET_RARITY: u32 = 16384;
+const N: usize = 10;
+const CENTER: mimc_fast::game::Coords = mimc_fast::game::Coords { x: 0, y: 0 };
+
+fn main() {
+    mine(16);
+    mine(32);
+    mine(64);
+    mine(128);
+    mine(256);
+}
+
+fn mine(chunkLength: u16) {
+    let explorer = SpiralMiner::new(CENTER, chunkLength);
+
+    let now = Instant::now();
+    let (threshold, overflowed) = P.overflowing_div(U512::from(PLANET_RARITY));
+    assert!(!overflowed);
+
+    for chunkFootprint in explorer.take(N) {
+        let x = chunkFootprint.bottomLeft.x;
+        let y = chunkFootprint.bottomLeft.y;
+        let size = chunkFootprint.sideLength;
+
+        let _ = (x..(x + size))
+            .into_par_iter()
+            .map(|xi| {
+                let mut planets = Vec::new();
+                for yi in y..(y + size) {
+                    let hash = MimcState::sponge(vec![xi, yi], 1, 220)[0].x;
+                    if hash < threshold {
+                        planets.push(Planet {
+                            coords: Coords { x: xi, y: yi },
+                            hash: hash.to_string(),
+                        });
+                    }
+                }
+                planets
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+    }
+
+    // this.hashRate = chunk.chunkFootprint.sideLength ** 2 / (miningTimeMillis / 1000);
+    let exp: f64 = (chunkLength * chunkLength).into();
+    let elapsed = now.elapsed().as_millis() as f64 / 1000f64 / N as f64;
+    println!("chunkLength {:?}: {:?}", chunkLength, (exp / elapsed));
+}
 
 lazy_static! {
-    static ref P: U512 = U512::from_dec_str("21888242871839275222246405745257275088548364400416034343698204186575808495617").unwrap();
+    static ref P: U512 = U512::from_dec_str(
+        "21888242871839275222246405745257275088548364400416034343698204186575808495617"
+    )
+    .unwrap();
     static ref C: Vec<PrimeElem> = {
-
         let consts = vec![
             "0",
             "7120861356467848435263064379192047478074060781135320967663101236819528304084",
@@ -242,9 +288,12 @@ lazy_static! {
             "2119542016932434047340813757208803962484943912710204325088879681995922344971",
             "0",
         ];
-        consts.into_iter().map(|c| PrimeElem { x: U512::from_dec_str(c).unwrap() })
+        consts
+            .into_iter()
+            .map(|c| PrimeElem {
+                x: U512::from_dec_str(c).unwrap(),
+            })
             .collect::<Vec<_>>()
-
     };
 }
 
@@ -315,18 +364,20 @@ impl MimcState {
     }
 
     fn sponge(inputs: Vec<i64>, n_outputs: usize, rounds: usize) -> Vec<PrimeElem> {
-        let inputs = inputs.into_iter()
+        let inputs = inputs
+            .into_iter()
             .map(|x| {
                 let bigx = if x < 0 {
-                    let (diff, overflowed) = P.overflowing_sub(
-                        U512::from_big_endian(&((-x).to_be_bytes())));
+                    let (diff, overflowed) =
+                        P.overflowing_sub(U512::from_big_endian(&((-x).to_be_bytes())));
                     assert!(!overflowed);
                     diff
                 } else {
                     U512::from_big_endian(&x.to_be_bytes())
                 };
                 PrimeElem { x: bigx }
-            }).collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         let mut state = MimcState::new(rounds, PrimeElem::zero());
         for elt in inputs {
             state.inject(&elt);
@@ -358,70 +409,4 @@ struct Planet {
 struct ChunkFootprint {
     bottomLeft: Coords,
     sideLength: i64,
-}
-
-#[allow(non_snake_case)]
-#[derive(Deserialize)]
-struct Task {
-    chunkFootprint: ChunkFootprint,
-    planetRarity: u32,
-}
-
-#[allow(non_snake_case)]
-#[derive(Serialize)]
-struct Response {
-    chunkFootprint: ChunkFootprint,
-    planetLocations: Vec<Planet>,
-}
-
-#[post("/mine", data = "<task>")]
-fn mine(task: Json<Task>) -> Json<Response> {
-    let x = task.chunkFootprint.bottomLeft.x;
-    let y = task.chunkFootprint.bottomLeft.y;
-    let size = task.chunkFootprint.sideLength;
-
-    let (threshold, overflowed) = P.overflowing_div(U512::from(task.planetRarity));
-    assert!(!overflowed);
-
-    let planets = (x..(x + size)).into_par_iter().map(|xi| {
-        let mut planets = Vec::new();
-        for yi in y..(y + size) {
-            let hash = MimcState::sponge(vec![xi, yi], 1, 220)[0].x;
-            if hash < threshold {
-                planets.push(Planet {
-                    coords: Coords { x: xi, y: yi },
-                    hash: hash.to_string(),
-                });
-            }
-        }
-        planets
-    }).flatten().collect::<Vec<_>>();
-
-    Json(Response {
-        chunkFootprint: task.chunkFootprint.clone(),
-        planetLocations: planets,
-    })
-}
-
-fn main() {
-    // for x in 0.. {
-    //     if x % 100 == 0 {
-    //         println!("trying ({}, 0)", x);
-    //     }
-    //     MimcState::sponge(vec![x, 0], 1, 220);
-    // }
-
-    // println!("{:?}", MimcState::sponge(vec![-2048, 0], 1, 220));
-    let allowed_origins = AllowedOrigins::all();
-    let cors = rocket_cors::CorsOptions {
-        allowed_origins,
-        allowed_methods: vec![Method::Post].into_iter().map(From::from).collect(),
-        allowed_headers: AllowedHeaders::all(),
-        allow_credentials: true,
-        ..Default::default()
-    }
-    .to_cors().unwrap();
-    let options_routes = catch_all_options_routes();
-
-    rocket::ignite().mount("/", routes![mine]).mount("/", options_routes).manage(cors.clone()).attach(cors).launch();
 }
